@@ -1,0 +1,54 @@
+settings:
+  - name: token
+    type: text-input
+    required: true
+    label:
+      en_US: Token
+      zh_Hans: Token
+      ja_JP: トークン
+  - name: encoding_aes_key
+    type: secret-input
+    required: true
+    label:
+      en_US: Encoding AES Key
+      zh_Hans: EncodingAESKey
+      ja_JP: Encoding AES Key
+  - name: app
+    type: app-selector
+    scope: chat
+    required: true
+    label:
+      en_US: App
+      zh_Hans: 应用
+      ja_JP: アプリ
+    placeholder:
+      en_US: Select the app/agent that should answer WeCom messages
+      zh_Hans: 选择用于回复企业微信消息的应用/代理
+      ja_JP: WeCom メッセージに応答するアプリ/エ
+  - name: ragflow_base_url
+    type: text-input
+    required: false
+    label:
+      en_US: RAGFlow Base URL
+      zh_Hans: RAGFlow 访问地址
+    placeholder:
+      en_US: e.g. http://192.168.1.100:9381
+      zh_Hans: 例如 http://192.168.1.100:9381
+    help:
+      en_US: Base URL of RAGFlow for document download links in reference list
+      zh_Hans: RAGFlow 的访问地址，用于参考文档的下载链接
+  - name: dify_service_api_key
+    type: secret-input
+    required: false
+    label:
+      en_US: Dify Service API Key
+      zh_Hans: Dify 服务 API 密钥
+    placeholder:
+      en_US: Paste the API Secret from Dify App → API Access
+      zh_Hans: 粘贴 Dify 应用 → API 访问 中的 API Secret
+    help:
+      en_US: Used to submit user feedback (👍/👎) back to Dify's message feedback system. Get it from your Dify app's API Access page.
+      zh_Hans: 用于将企业微信用户反馈（点赞/点踩）回传至 Dify 的消息满意度统计。在 Dify 应用 → API 访问 中获取。
+endpoints:
+  - endpoints/wecom_verify.yaml
+  - endpoints/wecom_message.yaml
