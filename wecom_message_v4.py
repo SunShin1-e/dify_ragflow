@@ -1,20 +1,17 @@
 """
-wecom-bot plugin — v3 (纯外部 API 版)
+wecom-bot plugin — v4 (智能机器人 + 自建应用 双模式)
 
-与 v2 的区别：
-  - 对话改用 Dify 外部 Service API (/v1/chat-messages)，不再走内部 API
-  - Dify 源码零侵入：不需要改 _get_user、plugin.py
-  - 需要配置 dify_service_api_key（对话 + 反馈共用）
-
-变更点摘要：
-  v2:  self.session.app.chat.invoke(...)          ← 内部 API，需改 Dify
-  v3:  _call_dify_service_api(...) → urllib SSE  ← 外部 API，零侵入
+与 v3 的区别：
+  - 同时支持智能机器人（JSON body）和自建应用（XML body）
+  - 自动检测消息格式，无需配置
 """
+
 import hashlib
 import json
 import logging
 import re
 import ssl
+import xml.etree.ElementTree as ET
 import time
 import urllib.error
 import urllib.request
@@ -595,31 +592,77 @@ class WeComMessageEndpoint(Endpoint):
         if not token or not encoding_key:
             return Response(status=400, response="missing token or encoding key")
 
+        logger.error(f"V4_DEBUG _invoke POST called, raw_data[:100]={r.data[:100] if r.data else 'None'}")
+
         signature = r.args.get("msg_signature")
         timestamp = r.args.get("timestamp")
         nonce = r.args.get("nonce")
         if not all([signature, timestamp, nonce]):
+            logger.error(f"V4_DEBUG missing signature params")
             return Response(status=400, response="missing signature params")
 
-        try:
-            body = r.get_json(force=True)
-        except Exception as exc:
-            return Response(status=400, response=f"invalid json: {exc}")
+        # 兼容 JSON（智能机器人）和 XML（自建应用）两种格式
+        raw_data = r.data
+        encrypt = None
 
-        encrypt = body.get("encrypt") if isinstance(body, Mapping) else None
+        # 先尝试 JSON
+        if raw_data and raw_data[:1] == b"{":
+            try:
+                body = json.loads(raw_data)
+                if isinstance(body, Mapping) and "encrypt" in body:
+                    encrypt = body["encrypt"]
+            except Exception as e:
+                logger.warning(f"JSON parse failed: {e}")
+
+        # 再尝试 XML
+        if not encrypt and raw_data and raw_data[:1] == b"<":
+            try:
+                root = ET.fromstring(raw_data)
+                encrypt = root.findtext("Encrypt")
+            except Exception as e:
+                logger.warning(f"XML parse failed: {e}")
+
         if not encrypt:
+            logger.error(f"V4_DEBUG missing encrypt, raw[:200]={raw_data[:200] if raw_data else 'None'}")
             return Response(status=400, response="missing encrypt")
 
         cryptor = WeComCryptor(token=token, encoding_aes_key=encoding_key)
+        payload = None
+
+        # 尝试 JSON 解密（智能机器人）
         try:
             payload = cryptor.decrypt(
                 signature=signature, timestamp=timestamp,
                 nonce=nonce, ciphertext=encrypt,
             )
-        except Exception as exc:
-            return Response(status=400, response=f"decrypt_failed:{exc}")
+        except Exception:
+            pass
+
+        # 回退 XML 解密（自建应用）
+        if payload is None:
+            try:
+                xml_str = cryptor.decrypt_string(
+                    signature=signature, timestamp=timestamp,
+                    nonce=nonce, ciphertext=encrypt,
+                )
+                root = ET.fromstring(xml_str)
+                payload = {
+                    "msgtype": root.findtext("MsgType") or "text",
+                    "msgid": root.findtext("MsgId") or "",
+                    "text": {"content": root.findtext("Content") or ""},
+                    "from": {
+                        "userid": root.findtext("FromUserName") or "",
+                        "name": root.findtext("FromUserName") or "",
+                    },
+                    "event": {},
+                }
+            except Exception as exc:
+                logger.error(f"V4_DEBUG decrypt all failed: {exc}")
+                return Response(status=400, response=f"decrypt_failed:{exc}")
 
         raw_app_id = (settings.get("app") or {}).get("app_id", "") or "noapp"
+        # 自建应用（XML body）走同步回复，智能机器人（JSON body）走流式轮询
+        is_self_built = (raw_data and raw_data[:1] == b"<")
 
         # ── 事件回调（反馈）──
         if payload.get("msgtype") == "event":
@@ -660,16 +703,53 @@ class WeComMessageEndpoint(Endpoint):
                 settings=settings,
             )
 
-        # 普通文本消息 —— 存入上下文，立即返回以让企微显示「正在回答」
         user_id = payload.get("from", {}).get("userid", "wecom-user")
         logger.info(f"User: {user_id}")
 
-        ctx = json.dumps({"user_id": user_id, "content": content}, ensure_ascii=False)
-        self.session.storage.set(f"wemctx_{raw_app_id}_{message_id}", ctx.encode())
-        self.session.storage.set(f"wemsg_{raw_app_id}_{message_id}", b"processing")
-
-        res = self._build_wecom_res(
-            message_id=message_id, content="", finish=False,
-            timestamp=timestamp, nonce=nonce, cryptor=cryptor,
-        )
-        return Response(status=200, response=res, mimetype="application/json")
+        if is_self_built:
+            # 自建应用：同步回复，直接调 LLM 返回答案，响应格式为 XML
+            api_key = (settings.get("dify_service_api_key") or "").strip()
+            if not api_key and self.session.storage.exist(f"fbkey_{raw_app_id}"):
+                api_key = self.session.storage.get(f"fbkey_{raw_app_id}").decode().strip()
+            ragflow_base_url = (settings.get("ragflow_base_url") or "").strip() or RAGFLOW_BASE_URL
+            answer = self._do_chat(
+                content=content, user_id=user_id, api_key=api_key,
+                raw_app_id=raw_app_id, message_id=message_id,
+                ragflow_base_url=ragflow_base_url,
+            )
+            if len(answer) > MAX_ANSWER_LEN:
+                answer = answer[:MAX_ANSWER_LEN] + "..."
+            # 自建应用返回 XML 格式（WeCom 标准格式）
+            to_user = payload.get("from", {}).get("userid", "")
+            from_user = payload.get("tousername", "") or raw_app_id
+            reply_plain = (
+                f"<xml>"
+                f"<ToUserName><![CDATA[{to_user}]]></ToUserName>"
+                f"<FromUserName><![CDATA[{from_user}]]></FromUserName>"
+                f"<CreateTime>{int(time.time())}</CreateTime>"
+                f"<MsgType><![CDATA[text]]></MsgType>"
+                f"<Content><![CDATA[{answer}]]></Content>"
+                f"</xml>"
+            )
+            encrypted = cryptor.encrypt_response(
+                plain=reply_plain, timestamp=timestamp, nonce=nonce,
+            )
+            xml_res = (
+                f"<xml>"
+                f"<Encrypt><![CDATA[{encrypted['encrypt']}]]></Encrypt>"
+                f"<MsgSignature><![CDATA[{encrypted['msgsignature']}]]></MsgSignature>"
+                f"<TimeStamp>{encrypted['timestamp']}</TimeStamp>"
+                f"<Nonce><![CDATA[{encrypted['nonce']}]]></Nonce>"
+                f"</xml>"
+            )
+            return Response(status=200, response=xml_res, mimetype="application/xml")
+        else:
+            # 智能机器人：流式轮询
+            ctx = json.dumps({"user_id": user_id, "content": content}, ensure_ascii=False)
+            self.session.storage.set(f"wemctx_{raw_app_id}_{message_id}", ctx.encode())
+            self.session.storage.set(f"wemsg_{raw_app_id}_{message_id}", b"processing")
+            res = self._build_wecom_res(
+                message_id=message_id, content="", finish=False,
+                timestamp=timestamp, nonce=nonce, cryptor=cryptor,
+            )
+            return Response(status=200, response=res, mimetype="application/json")
